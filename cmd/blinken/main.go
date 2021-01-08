@@ -22,14 +22,16 @@ import (
 )
 
 var (
-	port    = flag.String("port", "3000", "Port to serve.")
-	dotFile = flag.String("dotfile", "", "Dotmatrix-formatted input file.")
+	port      = flag.String("port", "3000", "Port to serve.")
+	inputFile = flag.String("input", "", "MJPEG source file.")
+	ss        = flag.Int("ss", 120, "Start seconds")
+	fps       = flag.Int("fps", 12, "Frames per second")
 )
 
 func main() {
 	flag.Parse()
 
-	f, err := os.Open(*dotFile)
+	f, err := os.Open(*inputFile)
 	if err != nil {
 		exit(err)
 	}
@@ -53,7 +55,7 @@ func main() {
 
 		go func() {
 			defer conn.Close()
-			w, h, err := negotiate(conn)
+			w, h, err := negotiateTelnet(conn)
 			if err != nil {
 				log.Println("telnet negotiation failed:", err)
 				return
@@ -73,7 +75,7 @@ func main() {
 	}
 }
 
-func negotiate(rw io.ReadWriter) (int, int, error) {
+func negotiateTelnet(rw io.ReadWriter) (int, int, error) {
 	if err := negotiateUnbufferedKeystrokes(rw); err != nil {
 		return 0, 0, err
 	}
@@ -244,28 +246,46 @@ func handleWriter(ctx context.Context, w io.Writer, r io.Reader, width, height i
 		}
 	}()
 
+	readFrame := func() (io.Reader, error) {
+		var buf bytes.Buffer
+		for {
+			token, err := bufr.ReadBytes(0xd9)
+			if err != nil {
+				return nil, err
+			}
+			if _, err := buf.Write(token); err != nil {
+				return nil, err
+			}
+			if len(token) > 1 && bytes.Equal(token[len(token)-2:], []byte{0xff, 0xd9}) {
+				return &buf, nil
+			}
+		}
+	}
+
+	if *ss > 0 {
+		for i := 0; i < (*ss * 25); i++ {
+			readFrame()
+		}
+	}
+
+	m := 0
+
 	for {
 		select {
 		case <-timer.C:
 			timer.Reset(time.Second / 25)
-			var buf bytes.Buffer
-			for {
-				token, err := bufr.ReadBytes(0xd9)
-				if err != nil {
-					log.Println(err)
-					return
-				}
-				if _, err := buf.Write(token); err != nil {
-					log.Println(err)
-					return
-				}
-				if len(token) > 1 && bytes.Equal(token[len(token)-2:], []byte{0xff, 0xd9}) {
-					break
-				}
+			frameR, err := readFrame()
+			if err != nil {
+				log.Println(err)
+				return
 			}
 
-			var err error
-			img, err := jpeg.Decode(&buf)
+			m++
+			if m%2 == 0 {
+				continue
+			}
+
+			img, err := jpeg.Decode(frameR)
 			if err != nil {
 				log.Println(err)
 				return
@@ -281,12 +301,12 @@ func handleWriter(ctx context.Context, w io.Writer, r io.Reader, width, height i
 }
 
 func hideCursor(w io.Writer) error {
-	_, err := fmt.Fprint(w, "\033[?25l")
+	_, err := fmt.Fprintf(w, "%s%s", "\033[?25l", "\033[40m\033[37m")
 	return err
 }
 
 func showCursor(w io.Writer) error {
-	_, err := fmt.Fprint(w, "\033[?12l\033[?25h")
+	_, err := fmt.Fprintf(w, "%s%s", "\033[?12l\033[?25h", "\033[0m")
 	return err
 }
 
@@ -340,7 +360,7 @@ func (f *Filter) Filter(img image.Image) image.Image {
 		img = imaging.Sharpen(img, f.Sharpen)
 	}
 	if f.Contrast != 0 {
-		img = imaging.AdjustContrast(img, f.Contrast)
+		// img = imaging.AdjustContrast(img, f.Contrast)
 	}
 	if f.Mirror {
 		img = imaging.FlipH(img)
@@ -348,6 +368,15 @@ func (f *Filter) Filter(img image.Image) image.Image {
 	if f.Invert {
 		img = imaging.Invert(img)
 	}
+
+	l := luminance(img)
+	// lighten dark images
+	b := (1 - l) + 1
+	// img = imaging.AdjustGamma(img, b)
+	// increase contrast on dark images
+	c := (l)*50 + 10
+	img = imaging.AdjustContrast(img, 25)
+	fmt.Println("luminance:", l, "contrast:", c, "brightness:", b)
 
 	if f.scale == 0 {
 		dx, dy := img.Bounds().Dx(), img.Bounds().Dy()
@@ -379,6 +408,19 @@ func scalar(dx, dy int, cols, rows int) float64 {
 	}
 
 	return scale
+}
+
+func luminance(img image.Image) float64 {
+	var l float64
+	var max float64
+	hist := imaging.Histogram(img)
+	for i, p := range hist {
+		if max < p {
+			max = p
+			l = float64(i)
+		}
+	}
+	return 1 - (256 / l * max)
 }
 
 // special characters
